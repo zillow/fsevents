@@ -1,69 +1,107 @@
+// export DEBUG_FSEVENTS=1
+// unset DEBUG_FSEVENTS
+var debug = process.env.DEBUG_FSEVENTS
+  ? function () { console.error.apply(console, arguments); }
+  : function () {}
+
 /*
 ** © 2013 by Philipp Dunkel <p.dunkel@me.com>. Licensed under MIT License.
 */
 
-var util = require('util');
-var events = require('events');
-var binding;
+module.exports = FSEventStream;
+
+var libFs = require('fs');
+var EventEmitter = require('events').EventEmitter;
+var Readable = require('stream').Readable;
+var inherits = require('util').inherits;
+
+var FSEvents;
 try {
-  binding = require('./build/Release/fswatch');
+  FSEvents = require('./build/Release/fswatch').FSEvents;
 } catch(ex) {
-  binding = require('./build/Debug/fswatch');
+  FSEvents = require('./build/Debug/fswatch').FSEvents;
 }
 
-var Fs = require('fs');
+inherits(FSEvents, EventEmitter);
+inherits(FSEventStream, Readable);
 
-module.exports = function(path) {
-  var fsevents = new FSEvents(path);
-  fsevents.on('fsevent', function(path, flags, id) {
-    var info = {
-      event:'unknown',
-      id:id,
-      path: path,
-      type: fileType(flags),
-      changes: fileChanges(flags),
-    };
-    if (FSEvents.kFSEventStreamEventFlagItemCreated & flags) {
-      info.event = 'created';
-    } else if (FSEvents.kFSEventStreamEventFlagItemRemoved & flags) {
-      info.event = 'deleted';
-    } else if (FSEvents.kFSEventStreamEventFlagItemRenamed & flags) {
-      info.event = 'moved';
-    } else if (FSEvents.kFSEventStreamEventFlagItemModified & flags) {
-      info.event = 'modified';
-    }
+function FSEventStream(path) {
+  if (!(this instanceof FSEventStream)) {
+      return new FSEventStream(path);
+  }
 
-    if (info.event == 'moved') {
-      Fs.stat(info.path, function(err, stat) {
+  Readable.call(this, { objectMode: true });
+
+  this._watch(path);
+}
+
+FSEventStream.prototype._watch = function (path) {
+  debug('_watch', path);
+  this.fsevents = new FSEvents(path);
+  this.fsevents.on('fsevent', this._dispatch.bind(this));
+};
+
+FSEventStream.prototype.close = function () {
+  debug('close', this.fsevents);
+  this.fsevents.stop();
+  this.push(null);
+};
+
+FSEventStream.prototype._getEventType = function (flags) {
+  if (FSEvents.kFSEventStreamEventFlagItemCreated   & flags) { return 'created'; }
+  if (FSEvents.kFSEventStreamEventFlagItemRemoved   & flags) { return 'deleted'; }
+  if (FSEvents.kFSEventStreamEventFlagItemRenamed   & flags) { return 'moved'; }
+  if (FSEvents.kFSEventStreamEventFlagItemModified  & flags) { return 'modified'; }
+};
+
+FSEventStream.prototype._getFileType = function (flags) {
+  if (FSEvents.kFSEventStreamEventFlagItemIsFile    & flags) { return 'file'; }
+  if (FSEvents.kFSEventStreamEventFlagItemIsDir     & flags) { return 'directory'; }
+  if (FSEvents.kFSEventStreamEventFlagItemIsSymlink & flags) { return 'symlink'; }
+};
+
+FSEventStream.prototype._getFileChanges = function (flags) {
+  return {
+    inode : !!(FSEvents.kFSEventStreamEventFlagItemInodeMetaMod  & flags),
+    finder: !!(FSEvents.kFSEventStreamEventFlagItemFinderInfoMod & flags),
+    access: !!(FSEvents.kFSEventStreamEventFlagItemChangeOwner   & flags),
+    xattrs: !!(FSEvents.kFSEventStreamEventFlagItemXattrMod      & flags)
+  };
+};
+
+FSEventStream.prototype._dispatch = function (path, flags, id) {
+  debug('_dispatch', id, flags, path);
+  var stream = this;
+  var info = {
+    id: id,
+    path: path,
+    type: stream._getFileType(flags),
+    event: stream._getEventType(flags),
+    changes: stream._getFileChanges(flags)
+  };
+
+  if (info.event === 'moved') {
+    libFs.stat(info.path, function (err, stat) {
       if (err || !stat) {
         info.event = 'moved-out';
       } else {
         info.event = 'moved-in';
       }
-      fsevents.emit('change', path, info);
-      fsevents.emit(info.event, path, info);
+      stream._publish(info);
     });
-    } else {
-      fsevents.emit('change', path, info);
-      if (info.event !== 'unknown') fsevents.emit(info.event, path, info);
-    }
-  });
-  return fsevents;
+  } else {
+    stream._publish(info);
+  }
 };
-var FSEvents = binding.FSEvents;
-util.inherits(FSEvents, events.EventEmitter);
 
-function fileType(flags) {
-  if (FSEvents.kFSEventStreamEventFlagItemIsFile & flags) return 'file';
-  if (FSEvents.kFSEventStreamEventFlagItemIsDir & flags) return 'directory';
-  if (FSEvents.kFSEventStreamEventFlagItemIsSymlink & flags) return 'symlink';
-}
+FSEventStream.prototype._publish = function (info) {
+  debug('_publish', info);
+  this.push(info);
+  if (info.event) {
+    this.emit(info.event, info);
+  }
+};
 
-function fileChanges(flags) {
-  var res = {};
-  res.inode = !!(FSEvents.kFSEventStreamEventFlagItemInodeMetaMod & flags);
-  res.finder = !!(FSEvents.kFSEventStreamEventFlagItemFinderInfoMod & flags);
-  res.access = !!(FSEvents.kFSEventStreamEventFlagItemChangeOwner & flags);
-  res.xattrs = !!(FSEvents.kFSEventStreamEventFlagItemXattrMod & flags);
-  return res;
-}
+FSEventStream.prototype._read = function () {
+  // no-op, handled via _dispatch + _publish
+};
